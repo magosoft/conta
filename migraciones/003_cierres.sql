@@ -493,9 +493,11 @@ BEGIN
     v_id_asiento := contabilidad.insertar_asiento(v_periodo.fecha_fin, p_gestion, p_periodo, 98, 2, NULL,
                                                   format('REVALUACION DE MONEDA EXTRANJERA AL %s (TC %s)', to_char(v_periodo.fecha_fin, 'DD/MM/YYYY'), v_tipo_cambio),
                                                   'SISTEMA', 'REVALUACION', NULL, 1, v_detalle, p_usuario);
-    IF EXISTS (SELECT 1 FROM contabilidad.dia_contable d WHERE d.fecha_contable = v_periodo.fecha_fin AND d.estado = 'CERRADO') THEN
-        PERFORM contabilidad.calcular_saldo_diario(v_periodo.fecha_fin);
-    END IF;
+    -- Se llama al cerrar el mes, con todos sus días cerrados: el último día queda cerrado con su saldo recalculado
+    PERFORM contabilidad.calcular_saldo_diario(v_periodo.fecha_fin);
+    UPDATE contabilidad.dia_contable d
+    SET estado = 'CERRADO', usuario_cierre = p_usuario, fecha_cierre = now()
+    WHERE d.fecha_contable = v_periodo.fecha_fin AND d.estado = 'ABIERTO';
     PERFORM contabilidad.establecer_modificacion_cerrado(v_valor_previo);
     RETURN v_id_asiento;
 END;

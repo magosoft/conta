@@ -541,6 +541,85 @@ $$;
 COMMENT ON FUNCTION contabilidad.migrar_desde_sai(text) IS
 'Migra el módulo cn del SAI desde el staging contabilidad_sai al esquema contabilidad vacío y devuelve un informe por paso. Correr una sola vez dentro de una transacción';
 
+-- -----------------------------------------------------------------------------
+-- Corrección de asientos migrados descuadrados
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION contabilidad.ajustar_asiento_migrado(p_id_asiento bigint, p_detalle jsonb, p_usuario text, p_motivo text)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = contabilidad, pg_temp
+AS $$
+DECLARE
+    v_asiento          asiento%ROWTYPE;
+    v_centro_defecto   smallint;
+    v_tipo_cambio      numeric;
+    v_lineas           integer;
+    v_suma_bs          numeric;
+    v_suma_usd         numeric;
+    v_valor_previo     boolean;
+BEGIN
+    PERFORM exigir_motivo(p_motivo);
+    SELECT * INTO v_asiento FROM asiento a WHERE a.id_asiento = p_id_asiento FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'No existe el asiento %', p_id_asiento;
+    END IF;
+    IF v_asiento.origen <> 'MIGRACION' OR v_asiento.estado <> 'VIGENTE' THEN
+        RAISE EXCEPTION 'Solo se ajustan asientos vigentes migrados del SAI (el % es % y %)', p_id_asiento, v_asiento.origen, v_asiento.estado;
+    END IF;
+    PERFORM bloquear_cierres(v_asiento.gestion);
+    IF EXISTS (SELECT 1 FROM gestion g WHERE g.gestion = v_asiento.gestion AND g.estado = 'CERRADA')
+       OR EXISTS (SELECT 1 FROM periodo_contable p WHERE p.gestion = v_asiento.gestion AND p.periodo = v_asiento.periodo AND p.estado = 'CERRADO') THEN
+        RAISE EXCEPTION 'Reabra el período % de la gestión % para ajustar el asiento %', v_asiento.periodo, v_asiento.gestion, p_id_asiento;
+    END IF;
+
+    SELECT g.codigo_centro_costo_defecto INTO v_centro_defecto FROM gestion g WHERE g.gestion = v_asiento.gestion;
+    PERFORM validar_detalle(p_detalle, 'INTERFAZ', v_centro_defecto);
+    IF EXISTS (SELECT 1 FROM lineas_de_detalle(p_detalle) l WHERE (l.importe_bs IS NULL OR l.importe_usd IS NULL) AND l.tipo_cambio IS NULL) THEN
+        v_tipo_cambio := tipo_cambio_vigente(v_asiento.fecha_contable, 2);
+    END IF;
+
+    -- El día del asiento migrado suele estar cerrado
+    v_valor_previo := establecer_modificacion_cerrado(true);
+    INSERT INTO asiento_detalle (id_asiento, numero_linea, codigo_cuenta, glosa, importe_bs, importe_usd, codigo_moneda, tipo_cambio,
+                                 codigo_unidad_negocio, codigo_centro_costo, codigo_tipo_auxiliar, codigo_auxiliar)
+    SELECT p_id_asiento,
+           (SELECT coalesce(max(d.numero_linea), 0) FROM asiento_detalle d WHERE d.id_asiento = p_id_asiento) + l.numero_linea,
+           l.codigo_cuenta, coalesce(l.glosa, 'AJUSTE DE MIGRACION: ' || p_motivo),
+           round(coalesce(l.importe_bs, l.importe_usd * coalesce(l.tipo_cambio, v_tipo_cambio)), 2),
+           round(coalesce(l.importe_usd, l.importe_bs / coalesce(l.tipo_cambio, v_tipo_cambio)), 2),
+           coalesce(l.codigo_moneda, 1), coalesce(l.tipo_cambio, v_tipo_cambio), l.codigo_unidad_negocio,
+           coalesce(l.codigo_centro_costo, v_centro_defecto), l.codigo_tipo_auxiliar, l.codigo_auxiliar
+    FROM lineas_de_detalle(p_detalle) l;
+    GET DIAGNOSTICS v_lineas = ROW_COUNT;
+
+    SELECT sum(d.importe_bs), sum(d.importe_usd) INTO v_suma_bs, v_suma_usd FROM asiento_detalle d WHERE d.id_asiento = p_id_asiento;
+    IF v_suma_bs <> 0 OR v_suma_usd <> 0 THEN
+        RAISE EXCEPTION 'Con el ajuste el asiento % sigue descuadrado: Bs %, USD %', p_id_asiento, v_suma_bs, v_suma_usd;
+    END IF;
+
+    UPDATE asiento
+    SET glosa = concat_ws(' · ', glosa, format('AJUSTADO POR %s EL %s: %s', p_usuario, to_char(now(), 'DD/MM/YYYY'), p_motivo))
+    WHERE id_asiento = p_id_asiento;
+    IF EXISTS (SELECT 1 FROM dia_contable d WHERE d.fecha_contable = v_asiento.fecha_contable AND d.estado = 'CERRADO') THEN
+        PERFORM calcular_saldo_diario(v_asiento.fecha_contable);
+    END IF;
+    PERFORM establecer_modificacion_cerrado(v_valor_previo);
+    RETURN v_lineas;
+END;
+$$;
+COMMENT ON FUNCTION contabilidad.ajustar_asiento_migrado(bigint, jsonb, text, text) IS
+'Agrega líneas a un asiento migrado del SAI para que cuadre (con el período reabierto). El motivo queda en la glosa del asiento';
+
 REVOKE ALL ON FUNCTION contabilidad.migrar_desde_sai(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION contabilidad.ajustar_asiento_migrado(bigint, jsonb, text, text) FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = 'contabilidad_supervisor') THEN
+        GRANT EXECUTE ON FUNCTION contabilidad.ajustar_asiento_migrado(bigint, jsonb, text, text) TO contabilidad_supervisor;
+    END IF;
+END;
+$$;
 
 COMMIT;

@@ -683,6 +683,10 @@ BEGIN
     IF v_asiento.estado <> 'VIGENTE' THEN
         RAISE EXCEPTION 'El asiento % ya está %', p_id_asiento, v_asiento.estado;
     END IF;
+    IF v_asiento.tipo_asiento_sistema = 'REVERSION' THEN
+        RAISE EXCEPTION 'El asiento % es la reversión del asiento %: no se anula, registre un asiento nuevo si corresponde',
+            p_id_asiento, v_asiento.id_asiento_revertido;
+    END IF;
     IF v_asiento.origen = 'SISTEMA' THEN
         RAISE EXCEPTION 'El asiento % es de %: se deshace reabriendo el cierre que lo generó', p_id_asiento, lower(v_asiento.tipo_asiento_sistema);
     END IF;
